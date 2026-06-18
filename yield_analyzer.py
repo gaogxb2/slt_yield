@@ -107,11 +107,32 @@ def build_category_summary(merged: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def export_excel(merged: pd.DataFrame, monthly: pd.DataFrame, category: pd.DataFrame, output_path: str):
+def build_temp_qty_merged(merged: pd.DataFrame) -> pd.DataFrame:
+    """同温度工序按月份合并 PassQty / TestQty / FailQty。"""
+    grouped = (
+        merged.groupby(["YearMonth", "温度类型"], as_index=False)
+        .agg(PassQty=("PassQty", "sum"), TestQty=("TestQty", "sum"), FailQty=("FailQty", "sum"))
+    )
+    grouped["Yield"] = grouped["PassQty"] / grouped["TestQty"]
+    grouped["FDPPM"] = grouped["FailQty"] / grouped["TestQty"] * 1_000_000
+    cat_order = {cat: i for i, cat in enumerate(TEMP_LABELS)}
+    grouped["_sort"] = grouped["温度类型"].map(cat_order)
+    grouped = grouped.sort_values(["YearMonth", "_sort"]).drop(columns="_sort")
+    return grouped[["YearMonth", "温度类型", "PassQty", "TestQty", "FailQty", "Yield", "FDPPM"]]
+
+
+def export_excel(
+    merged: pd.DataFrame,
+    monthly: pd.DataFrame,
+    category: pd.DataFrame,
+    temp_qty: pd.DataFrame,
+    output_path: str,
+):
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         merged.to_excel(writer, sheet_name="工序汇总", index=False)
         monthly.to_excel(writer, sheet_name="月度良率", index=False)
         category.to_excel(writer, sheet_name="温度分类汇总", index=False)
+        temp_qty.to_excel(writer, sheet_name="温度Qty合并", index=False)
 
         from openpyxl.styles import Font
 
@@ -280,7 +301,8 @@ class YieldAnalyzerApp(tk.Tk):
             merged = merge_by_process(df, mapping)
             monthly = build_monthly_summary(merged)
             category = build_category_summary(merged)
-            export_excel(merged, monthly, category, output_path)
+            temp_qty = build_temp_qty_merged(merged)
+            export_excel(merged, monthly, category, temp_qty, output_path)
 
             self.merged_df = merged
             self.monthly_df = monthly
@@ -348,8 +370,9 @@ class YieldAnalyzerApp(tk.Tk):
         self.fig_cat.clear()
         ax = self.fig_cat.add_subplot(111)
         merged = self.merged_df
+        monthly = self.monthly_df
         months = sorted(merged["YearMonth"].unique())
-        x = range(len(months))
+        x = list(range(len(months)))
 
         for cat in TEMP_LABELS:
             yields = []
@@ -368,16 +391,52 @@ class YieldAnalyzerApp(tk.Tk):
                 color=CATEGORY_COLORS[cat],
                 linewidth=2,
             )
+            for xi, y in zip(x, yields):
+                if y is not None:
+                    ax.annotate(
+                        f"{y * 100:.1f}%",
+                        (xi, y),
+                        textcoords="offset points",
+                        xytext=(0, 8),
+                        ha="center",
+                        fontsize=7,
+                        color=CATEGORY_COLORS[cat],
+                    )
 
-        ax.set_xticks(list(x))
+        total_yields = monthly["总Yield"].tolist()
+        ax.plot(
+            x,
+            total_yields,
+            marker="s",
+            markersize=5,
+            label="总Yield",
+            color="#C00000",
+            linewidth=2.5,
+            linestyle="--",
+        )
+        for xi, y in zip(x, total_yields):
+            if y is not None:
+                ax.annotate(
+                    f"{y * 100:.1f}%",
+                    (xi, y),
+                    textcoords="offset points",
+                    xytext=(0, -12),
+                    ha="center",
+                    fontsize=7,
+                    color="#C00000",
+                )
+
+        ax.set_xticks(x)
         ax.set_xticklabels(months, rotation=45, ha="right")
         ax.set_ylabel("Yield")
         ax.set_xlabel("YearMonth")
-        ax.set_title("常温 / 低温 / 高温 工序月度合并良率")
+        ax.set_title("常温 / 低温 / 高温 工序月度合并良率及总Yield（Qty合并后计算）")
         ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
-        ax.legend(loc="upper right")
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=8)
         ax.grid(True, alpha=0.3)
-        self.fig_cat.tight_layout()
+        ax.margins(y=0.12)
+        self.fig_cat.subplots_adjust(right=0.78)
+        self.fig_cat.tight_layout(rect=[0, 0, 0.78, 1])
         self.canvas_cat.draw()
 
 
