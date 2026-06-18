@@ -126,6 +126,35 @@ def get_monthly_total_yields(merged: pd.DataFrame) -> tuple[list[str], list[floa
     return months, totals
 
 
+def get_monthly_total_test_qty(merged: pd.DataFrame, months: list[str]) -> list[int]:
+    return [int(merged[merged["YearMonth"] == ym]["TestQty"].sum()) for ym in months]
+
+
+def get_monthly_test_qty_by_category(merged: pd.DataFrame, months: list[str]) -> dict[str, list[int]]:
+    result: dict[str, list[int]] = {cat: [] for cat in TEMP_LABELS}
+    for ym in months:
+        month_data = merged[merged["YearMonth"] == ym]
+        for cat in TEMP_LABELS:
+            cat_data = month_data[month_data["温度类型"] == cat]
+            result[cat].append(int(cat_data["TestQty"].sum()) if not cat_data.empty else 0)
+    return result
+
+
+def _setup_test_qty_bars(ax, ax_bar, x: list[int], test_qtys: list[int], label: str = "TestQty"):
+    """在折线图底层叠加 TestQty 柱状图（右侧 Y 轴）。"""
+    ax_bar.bar(x, test_qtys, width=0.55, alpha=0.22, color="#888888", label=label, zorder=1)
+    ax_bar.set_ylabel("TestQty")
+    ax_bar.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _p: f"{int(v):,}"))
+    ax.set_zorder(2)
+    ax.patch.set_visible(False)
+
+
+def _merge_legends(ax, ax_bar, loc="upper right", **kwargs):
+    handles1, labels1 = ax.get_legend_handles_labels()
+    handles2, labels2 = ax_bar.get_legend_handles_labels()
+    ax.legend(handles1 + handles2, labels1 + labels2, **kwargs)
+
+
 def build_monthly_summary(merged: pd.DataFrame) -> pd.DataFrame:
     months = sorted(merged["YearMonth"].unique())
     processes = sort_processes(merged["工序"].unique().tolist())
@@ -433,13 +462,17 @@ class YieldAnalyzerApp(tk.Tk):
         months, total_yields = get_monthly_total_yields(merged)
         x = list(range(len(months)))
         x_labels = months
+        test_qtys = get_monthly_total_test_qty(merged, months)
+
+        ax_bar = ax.twinx()
+        _setup_test_qty_bars(ax, ax_bar, x, test_qtys)
 
         for proc in sort_processes(merged["工序"].unique().tolist()):
             cat = merged.loc[merged["工序"] == proc, "温度类型"].iloc[0]
             color = CATEGORY_COLORS.get(cat, "#666666")
             proc_by_month = monthly.set_index("YearMonth")[proc]
             y_vals = [proc_by_month.get(ym) for ym in months]
-            ax.plot(x, y_vals, marker="o", markersize=4, label=proc, color=color, linewidth=1.5)
+            ax.plot(x, y_vals, marker="o", markersize=4, label=proc, color=color, linewidth=1.5, zorder=3)
 
         ax.plot(
             x,
@@ -450,6 +483,7 @@ class YieldAnalyzerApp(tk.Tk):
             color="#C00000",
             linewidth=2.5,
             linestyle="--",
+            zorder=3,
         )
         for xi, y in zip(x, total_yields):
             if y is not None:
@@ -469,8 +503,8 @@ class YieldAnalyzerApp(tk.Tk):
         ax.set_xlabel("YearMonth")
         ax.set_title("各工序月度良率及总Yield（总Yield = 常温 × 低温 × 高温）")
         ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
-        ax.legend(loc="upper right", fontsize=8, ncol=2)
-        ax.grid(True, alpha=0.3)
+        _merge_legends(ax, ax_bar, loc="upper right", fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3, zorder=0)
         ax.margins(y=0.12)
         self.fig_all.tight_layout()
         self.canvas_all.draw()
@@ -481,6 +515,26 @@ class YieldAnalyzerApp(tk.Tk):
         merged = self.merged_df
         months, total_yields = get_monthly_total_yields(merged)
         x = list(range(len(months)))
+        cat_test_qty = get_monthly_test_qty_by_category(merged, months)
+
+        ax_bar = ax.twinx()
+        bottom = [0] * len(months)
+        for cat in TEMP_LABELS:
+            ax_bar.bar(
+                x,
+                cat_test_qty[cat],
+                bottom=bottom,
+                width=0.55,
+                alpha=0.22,
+                color=CATEGORY_COLORS[cat],
+                label=f"{cat}TestQty",
+                zorder=1,
+            )
+            bottom = [b + q for b, q in zip(bottom, cat_test_qty[cat])]
+        ax_bar.set_ylabel("TestQty")
+        ax_bar.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _p: f"{int(v):,}"))
+        ax.set_zorder(2)
+        ax.patch.set_visible(False)
 
         for cat in TEMP_LABELS:
             yields = []
@@ -498,6 +552,7 @@ class YieldAnalyzerApp(tk.Tk):
                 label=f"{cat}工序",
                 color=CATEGORY_COLORS[cat],
                 linewidth=2,
+                zorder=3,
             )
             for xi, y in zip(x, yields):
                 if y is not None:
@@ -520,6 +575,7 @@ class YieldAnalyzerApp(tk.Tk):
             color="#C00000",
             linewidth=2.5,
             linestyle="--",
+            zorder=3,
         )
         for xi, y in zip(x, total_yields):
             if y is not None:
@@ -539,8 +595,8 @@ class YieldAnalyzerApp(tk.Tk):
         ax.set_xlabel("YearMonth")
         ax.set_title("常温 / 低温 / 高温 工序月度合并良率及总Yield（总Yield = 常温 × 低温 × 高温）")
         ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
-        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=8)
-        ax.grid(True, alpha=0.3)
+        _merge_legends(ax, ax_bar, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=8)
+        ax.grid(True, alpha=0.3, zorder=0)
         ax.margins(y=0.12)
         self.fig_cat.subplots_adjust(right=0.78)
         self.fig_cat.tight_layout(rect=[0, 0, 0.78, 1])
