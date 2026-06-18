@@ -4,7 +4,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
-from datetime import datetime
+import json
 
 import pandas as pd
 import matplotlib
@@ -20,6 +20,45 @@ plt.rcParams["axes.unicode_minus"] = False
 REQUIRED_COLUMNS = ["工序", "PassQty", "TestQty", "FailQty", "YearMonth"]
 TEMP_LABELS = ("常温", "低温", "高温")
 CATEGORY_COLORS = {"常温": "#4472C4", "低温": "#70AD47", "高温": "#ED7D31"}
+CONFIG_PATH = Path(__file__).parent / "process_categories.json"
+DEFAULT_CATEGORY_MAP = {
+    "MT1": "常温",
+    "MT2": "常温",
+    "MT3": "常温",
+    "MT9": "低温",
+    "MT10": "高温",
+    "MT11": "高温",
+}
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"last_input": "", "files": {}}
+
+
+def save_config(config: dict) -> None:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def file_config_key(filepath: str) -> str:
+    return str(Path(filepath).resolve())
+
+
+def get_saved_categories(filepath: str, config: dict) -> dict[str, str]:
+    return config.get("files", {}).get(file_config_key(filepath), {})
+
+
+def save_categories_for_file(filepath: str, mapping: dict[str, str], config: dict) -> None:
+    key = file_config_key(filepath)
+    config.setdefault("files", {})[key] = mapping
+    config["last_input"] = key
+    save_config(config)
 
 
 def sort_processes(processes: list[str]) -> list[str]:
@@ -63,6 +102,24 @@ def merge_by_process(df: pd.DataFrame, process_category: dict[str, str]) -> pd.D
     return grouped
 
 
+def calc_category_yield(month_data: pd.DataFrame, category: str) -> float | None:
+    cat_data = month_data[month_data["温度类型"] == category]
+    if cat_data.empty or cat_data["TestQty"].sum() == 0:
+        return None
+    return cat_data["PassQty"].sum() / cat_data["TestQty"].sum()
+
+
+def calc_total_yield(month_data: pd.DataFrame) -> float | None:
+    """总Yield = 常温Yield × 低温Yield × 高温Yield（各温度下 Qty 合并后计算）。"""
+    total = 1.0
+    for cat in TEMP_LABELS:
+        y = calc_category_yield(month_data, cat)
+        if y is None:
+            return None
+        total *= y
+    return total
+
+
 def build_monthly_summary(merged: pd.DataFrame) -> pd.DataFrame:
     months = sorted(merged["YearMonth"].unique())
     processes = sort_processes(merged["工序"].unique().tolist())
@@ -71,16 +128,13 @@ def build_monthly_summary(merged: pd.DataFrame) -> pd.DataFrame:
     for ym in months:
         month_data = merged[merged["YearMonth"] == ym]
         row = {"YearMonth": ym}
-        total_yield = 1.0
         for proc in processes:
             proc_row = month_data[month_data["工序"] == proc]
             if proc_row.empty:
                 row[proc] = None
             else:
-                y = proc_row.iloc[0]["Yield"]
-                row[proc] = y
-                total_yield *= y
-        row["总Yield"] = total_yield
+                row[proc] = proc_row.iloc[0]["Yield"]
+        row["总Yield"] = calc_total_yield(month_data)
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -163,8 +217,11 @@ class YieldAnalyzerApp(tk.Tk):
         self.process_vars: dict[str, tk.StringVar] = {}
         self.merged_df: pd.DataFrame | None = None
         self.monthly_df: pd.DataFrame | None = None
+        self.config = load_config()
+        self._loading = False
 
         self._build_ui()
+        self._restore_last_session()
 
     def _build_ui(self):
         main = ttk.Frame(self, padding=10)
@@ -234,6 +291,22 @@ class YieldAnalyzerApp(tk.Tk):
         if path:
             self.output_path.set(path)
 
+    def _restore_last_session(self):
+        last = self.config.get("last_input", "")
+        if last and Path(last).exists():
+            self.input_path.set(last)
+            self.output_path.set(str(Path(last).with_name(Path(last).stem + "_output.xlsx")))
+            self._load_processes()
+
+    def _on_category_changed(self, *_args):
+        if self._loading:
+            return
+        path = self.input_path.get().strip()
+        if not path or not self.process_vars:
+            return
+        mapping = {proc: self.process_vars[proc].get() for proc in self.processes}
+        save_categories_for_file(path, mapping, self.config)
+
     def _load_processes(self):
         path = self.input_path.get().strip()
         if not path:
@@ -260,18 +333,32 @@ class YieldAnalyzerApp(tk.Tk):
             ttk.Label(header, text=cat, width=10, font=("", 10, "bold")).pack(side=tk.LEFT, padx=8)
 
         self.process_vars.clear()
-        default_map = {"MT1": "常温", "MT2": "常温", "MT3": "常温", "MT9": "低温", "MT10": "高温", "MT11": "高温"}
+        saved = get_saved_categories(path, self.config)
+        self._loading = True
 
         for proc in self.processes:
             row = ttk.Frame(self.process_inner)
             row.pack(fill=tk.X, pady=2)
             ttk.Label(row, text=proc, width=12).pack(side=tk.LEFT, padx=4)
-            var = tk.StringVar(value=default_map.get(proc, "常温"))
+            if proc in saved and saved[proc] in TEMP_LABELS:
+                initial = saved[proc]
+            else:
+                initial = DEFAULT_CATEGORY_MAP.get(proc, "常温")
+            var = tk.StringVar(value=initial)
+            var.trace_add("write", self._on_category_changed)
             self.process_vars[proc] = var
             for cat in TEMP_LABELS:
                 ttk.Radiobutton(row, text="", variable=var, value=cat).pack(side=tk.LEFT, padx=28)
 
-        self.status_var.set(f"已加载 {len(self.processes)} 个工序: {', '.join(self.processes)}")
+        self._loading = False
+        save_categories_for_file(
+            path,
+            {proc: self.process_vars[proc].get() for proc in self.processes},
+            self.config,
+        )
+
+        saved_hint = "（已恢复上次分类）" if saved else ""
+        self.status_var.set(f"已加载 {len(self.processes)} 个工序: {', '.join(self.processes)}{saved_hint}")
 
     def _validate_categories(self) -> dict[str, str] | None:
         if not self.processes:
@@ -295,6 +382,8 @@ class YieldAnalyzerApp(tk.Tk):
         mapping = self._validate_categories()
         if mapping is None:
             return
+
+        save_categories_for_file(input_path, mapping, self.config)
 
         try:
             df = read_yield_file(input_path)
@@ -359,7 +448,7 @@ class YieldAnalyzerApp(tk.Tk):
         ax.set_xticklabels(x_labels, rotation=45, ha="right")
         ax.set_ylabel("Yield")
         ax.set_xlabel("YearMonth")
-        ax.set_title("各工序月度良率及总Yield（总Yield = 当月各工序良率之积）")
+        ax.set_title("各工序月度良率及总Yield（总Yield = 常温 × 低温 × 高温）")
         ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
         ax.legend(loc="upper right", fontsize=8, ncol=2)
         ax.grid(True, alpha=0.3)
@@ -430,7 +519,7 @@ class YieldAnalyzerApp(tk.Tk):
         ax.set_xticklabels(months, rotation=45, ha="right")
         ax.set_ylabel("Yield")
         ax.set_xlabel("YearMonth")
-        ax.set_title("常温 / 低温 / 高温 工序月度合并良率及总Yield（Qty合并后计算）")
+        ax.set_title("常温 / 低温 / 高温 工序月度合并良率及总Yield（总Yield = 常温 × 低温 × 高温）")
         ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
         ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=8)
         ax.grid(True, alpha=0.3)
