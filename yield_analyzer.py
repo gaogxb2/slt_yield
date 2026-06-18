@@ -120,6 +120,12 @@ def calc_total_yield(month_data: pd.DataFrame) -> float | None:
     return total
 
 
+def get_monthly_total_yields(merged: pd.DataFrame) -> tuple[list[str], list[float | None]]:
+    months = sorted(merged["YearMonth"].unique())
+    totals = [calc_total_yield(merged[merged["YearMonth"] == ym]) for ym in months]
+    return months, totals
+
+
 def build_monthly_summary(merged: pd.DataFrame) -> pd.DataFrame:
     months = sorted(merged["YearMonth"].unique())
     processes = sort_processes(merged["工序"].unique().tolist())
@@ -424,18 +430,20 @@ class YieldAnalyzerApp(tk.Tk):
         ax = self.fig_all.add_subplot(111)
         monthly = self.monthly_df
         merged = self.merged_df
-        x = range(len(monthly))
-        x_labels = monthly["YearMonth"].tolist()
+        months, total_yields = get_monthly_total_yields(merged)
+        x = list(range(len(months)))
+        x_labels = months
 
         for proc in sort_processes(merged["工序"].unique().tolist()):
             cat = merged.loc[merged["工序"] == proc, "温度类型"].iloc[0]
             color = CATEGORY_COLORS.get(cat, "#666666")
-            y_vals = monthly[proc].tolist()
+            proc_by_month = monthly.set_index("YearMonth")[proc]
+            y_vals = [proc_by_month.get(ym) for ym in months]
             ax.plot(x, y_vals, marker="o", markersize=4, label=proc, color=color, linewidth=1.5)
 
         ax.plot(
             x,
-            monthly["总Yield"].tolist(),
+            total_yields,
             marker="s",
             markersize=5,
             label="总Yield",
@@ -443,8 +451,19 @@ class YieldAnalyzerApp(tk.Tk):
             linewidth=2.5,
             linestyle="--",
         )
+        for xi, y in zip(x, total_yields):
+            if y is not None:
+                ax.annotate(
+                    f"{y * 100:.1f}%",
+                    (xi, y),
+                    textcoords="offset points",
+                    xytext=(0, -12),
+                    ha="center",
+                    fontsize=7,
+                    color="#C00000",
+                )
 
-        ax.set_xticks(list(x))
+        ax.set_xticks(x)
         ax.set_xticklabels(x_labels, rotation=45, ha="right")
         ax.set_ylabel("Yield")
         ax.set_xlabel("YearMonth")
@@ -452,6 +471,7 @@ class YieldAnalyzerApp(tk.Tk):
         ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
         ax.legend(loc="upper right", fontsize=8, ncol=2)
         ax.grid(True, alpha=0.3)
+        ax.margins(y=0.12)
         self.fig_all.tight_layout()
         self.canvas_all.draw()
 
@@ -459,8 +479,7 @@ class YieldAnalyzerApp(tk.Tk):
         self.fig_cat.clear()
         ax = self.fig_cat.add_subplot(111)
         merged = self.merged_df
-        monthly = self.monthly_df
-        months = sorted(merged["YearMonth"].unique())
+        months, total_yields = get_monthly_total_yields(merged)
         x = list(range(len(months)))
 
         for cat in TEMP_LABELS:
@@ -492,7 +511,6 @@ class YieldAnalyzerApp(tk.Tk):
                         color=CATEGORY_COLORS[cat],
                     )
 
-        total_yields = monthly["总Yield"].tolist()
         ax.plot(
             x,
             total_yields,
