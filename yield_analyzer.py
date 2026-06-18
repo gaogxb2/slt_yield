@@ -18,7 +18,7 @@ plt.rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "SimHei", "Arial U
 plt.rcParams["axes.unicode_minus"] = False
 
 REQUIRED_COLUMNS = ["工序", "PassQty", "TestQty", "FailQty", "YearMonth"]
-BIN_REQUIRED_COLUMNS = ["TEST_STATE", "BIN_NAME", "YEAR", "MONTH", "FAIL_QTY", "TEST_QTY"]
+BIN_REQUIRED_COLUMNS = ["TEST_STAGE", "BIN_NAME", "YEAR", "MONTH", "FAIL_QTY", "TEST_QTY"]
 PASS_BIN_NAMES = {"PASS", "Pass", "pass"}
 TEMP_LABELS = ("常温", "低温", "高温")
 CATEGORY_COLORS = {"常温": "#4472C4", "低温": "#70AD47", "高温": "#ED7D31"}
@@ -119,8 +119,8 @@ def read_bin_file(filepath: str, raw: pd.DataFrame | None = None) -> pd.DataFram
     if missing:
         raise ValueError(f"缺少必要列: {', '.join(missing)}")
 
-    df = df.dropna(subset=["TEST_STATE", "BIN_NAME", "YEAR", "MONTH"]).copy()
-    df["TEST_STATE"] = df["TEST_STATE"].astype(str)
+    df = df.dropna(subset=["TEST_STAGE", "BIN_NAME", "YEAR", "MONTH"]).copy()
+    df["TEST_STAGE"] = df["TEST_STAGE"].astype(str)
     df["BIN_NAME"] = df["BIN_NAME"].astype(str)
     for col in ("FAIL_QTY", "TEST_QTY", "YEAR", "MONTH"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -142,7 +142,7 @@ def prepare_bin_category_chart(
 ) -> tuple[list[str], list[int], list[str], dict[str, list[float | None]]]:
     """按温度聚合：月度 TestQty 及 Top6 Fail Bin 占比。"""
     procs = sort_processes([p for p, cat in process_category.items() if cat == category])
-    sub = df[df["TEST_STATE"].isin(procs)].copy()
+    sub = df[df["TEST_STAGE"].isin(procs)].copy()
     if sub.empty:
         return [], [], [], {}
 
@@ -152,7 +152,7 @@ def prepare_bin_category_chart(
         month_data = sub[sub["YearMonth"] == ym]
         qty = 0
         for proc in procs:
-            proc_data = month_data[month_data["TEST_STATE"] == proc]
+            proc_data = month_data[month_data["TEST_STAGE"] == proc]
             if not proc_data.empty:
                 qty += int(proc_data["TEST_QTY"].iloc[0])
         test_qtys.append(qty)
@@ -167,7 +167,7 @@ def prepare_bin_category_chart(
         month_data = sub[sub["YearMonth"] == ym]
         total_test = 0
         for proc in procs:
-            proc_data = month_data[month_data["TEST_STATE"] == proc]
+            proc_data = month_data[month_data["TEST_STAGE"] == proc]
             if not proc_data.empty:
                 total_test += int(proc_data["TEST_QTY"].iloc[0])
         for b in top_bins:
@@ -528,7 +528,7 @@ class YieldAnalyzerApp(tk.Tk):
                 self.processes = sort_processes(df["工序"].astype(str).unique().tolist())
                 self._setup_yield_tabs()
             else:
-                self.processes = sort_processes(df["TEST_STATE"].astype(str).unique().tolist())
+                self.processes = sort_processes(df["TEST_STAGE"].astype(str).unique().tolist())
                 self._setup_bin_tabs()
         except Exception as e:
             messagebox.showerror("读取失败", str(e))
