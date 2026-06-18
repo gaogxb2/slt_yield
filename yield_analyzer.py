@@ -18,6 +18,8 @@ plt.rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "SimHei", "Arial U
 plt.rcParams["axes.unicode_minus"] = False
 
 REQUIRED_COLUMNS = ["工序", "PassQty", "TestQty", "FailQty", "YearMonth"]
+BIN_REQUIRED_COLUMNS = ["TEST_STATE", "BIN_NAME", "YEAR", "MONTH", "FAIL_QTY", "TEST_QTY"]
+PASS_BIN_NAMES = {"PASS", "Pass", "pass"}
 TEMP_LABELS = ("常温", "低温", "高温")
 CATEGORY_COLORS = {"常温": "#4472C4", "低温": "#70AD47", "高温": "#ED7D31"}
 CONFIG_PATH = Path(__file__).parent / "process_categories.json"
@@ -69,8 +71,29 @@ def sort_processes(processes: list[str]) -> list[str]:
     return sorted(processes, key=key)
 
 
-def read_yield_file(filepath: str) -> pd.DataFrame:
-    df = pd.read_excel(filepath, engine="openpyxl")
+def detect_file_format(columns: list[str]) -> str:
+    cols = set(columns)
+    if set(REQUIRED_COLUMNS).issubset(cols):
+        return "yield"
+    if set(BIN_REQUIRED_COLUMNS).issubset(cols):
+        return "bin"
+    raise ValueError(
+        "无法识别文件格式，需包含 yield 列"
+        f"({', '.join(REQUIRED_COLUMNS)}) 或 bin 列"
+        f"({', '.join(BIN_REQUIRED_COLUMNS)})"
+    )
+
+
+def read_excel_file(filepath: str) -> tuple[str, pd.DataFrame]:
+    raw = pd.read_excel(filepath, engine="openpyxl")
+    fmt = detect_file_format(raw.columns.tolist())
+    if fmt == "yield":
+        return fmt, read_yield_file(filepath, raw)
+    return fmt, read_bin_file(filepath, raw)
+
+
+def read_yield_file(filepath: str, raw: pd.DataFrame | None = None) -> pd.DataFrame:
+    df = raw if raw is not None else pd.read_excel(filepath, engine="openpyxl")
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"缺少必要列: {', '.join(missing)}")
@@ -88,6 +111,73 @@ def read_yield_file(filepath: str) -> pd.DataFrame:
 
     df["YearMonth"] = df["YearMonth"].astype(str)
     return df
+
+
+def read_bin_file(filepath: str, raw: pd.DataFrame | None = None) -> pd.DataFrame:
+    df = raw if raw is not None else pd.read_excel(filepath, engine="openpyxl")
+    missing = [c for c in BIN_REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"缺少必要列: {', '.join(missing)}")
+
+    df = df.dropna(subset=["TEST_STATE", "BIN_NAME", "YEAR", "MONTH"]).copy()
+    df["TEST_STATE"] = df["TEST_STATE"].astype(str)
+    df["BIN_NAME"] = df["BIN_NAME"].astype(str)
+    for col in ("FAIL_QTY", "TEST_QTY", "YEAR", "MONTH"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["FAIL_QTY", "TEST_QTY", "YEAR", "MONTH"])
+    df["FAIL_QTY"] = df["FAIL_QTY"].astype(int)
+    df["TEST_QTY"] = df["TEST_QTY"].astype(int)
+    df["YEAR"] = df["YEAR"].astype(int)
+    df["MONTH"] = df["MONTH"].astype(int)
+    df["YearMonth"] = df["YEAR"].astype(str) + "-" + df["MONTH"].astype(str).str.zfill(2)
+    return df
+
+
+def is_pass_bin(name: str) -> bool:
+    return name.upper() == "PASS" or name in PASS_BIN_NAMES
+
+
+def prepare_bin_category_chart(
+    df: pd.DataFrame, process_category: dict[str, str], category: str
+) -> tuple[list[str], list[int], list[str], dict[str, list[float | None]]]:
+    """按温度聚合：月度 TestQty 及 Top6 Fail Bin 占比。"""
+    procs = sort_processes([p for p, cat in process_category.items() if cat == category])
+    sub = df[df["TEST_STATE"].isin(procs)].copy()
+    if sub.empty:
+        return [], [], [], {}
+
+    months = sorted(sub["YearMonth"].unique())
+    test_qtys: list[int] = []
+    for ym in months:
+        month_data = sub[sub["YearMonth"] == ym]
+        qty = 0
+        for proc in procs:
+            proc_data = month_data[month_data["TEST_STATE"] == proc]
+            if not proc_data.empty:
+                qty += int(proc_data["TEST_QTY"].iloc[0])
+        test_qtys.append(qty)
+
+    fail_data = sub[~sub["BIN_NAME"].apply(is_pass_bin)]
+    top_bins = (
+        fail_data.groupby("BIN_NAME")["FAIL_QTY"].sum().sort_values(ascending=False).head(6).index.tolist()
+    )
+
+    bin_props: dict[str, list[float | None]] = {b: [] for b in top_bins}
+    for ym in months:
+        month_data = sub[sub["YearMonth"] == ym]
+        total_test = 0
+        for proc in procs:
+            proc_data = month_data[month_data["TEST_STATE"] == proc]
+            if not proc_data.empty:
+                total_test += int(proc_data["TEST_QTY"].iloc[0])
+        for b in top_bins:
+            if total_test == 0:
+                bin_props[b].append(None)
+            else:
+                fail = int(month_data[month_data["BIN_NAME"] == b]["FAIL_QTY"].sum())
+                bin_props[b].append(fail / total_test)
+
+    return months, test_qtys, top_bins, bin_props
 
 
 def merge_by_process(df: pd.DataFrame, process_category: dict[str, str]) -> pd.DataFrame:
@@ -153,6 +243,68 @@ def _merge_legends(ax, ax_bar, loc="upper right", **kwargs):
     handles1, labels1 = ax.get_legend_handles_labels()
     handles2, labels2 = ax_bar.get_legend_handles_labels()
     ax.legend(handles1 + handles2, labels1 + labels2, **kwargs)
+
+
+BIN_LINE_COLORS = ["#E74C3C", "#9B59B6", "#F39C12", "#1ABC9C", "#3498DB", "#E67E22"]
+
+
+def draw_bin_category_chart(
+    fig: Figure,
+    df: pd.DataFrame,
+    process_category: dict[str, str],
+    category: str,
+):
+    fig.clear()
+    months, test_qtys, top_bins, bin_props = prepare_bin_category_chart(df, process_category, category)
+    if not months:
+        ax = fig.add_subplot(111)
+        ax.text(0.5, 0.5, f"{category}：无数据", ha="center", va="center", transform=ax.transAxes)
+        return
+
+    ax_qty = fig.add_subplot(111)
+    x = list(range(len(months)))
+    ax_qty.bar(x, test_qtys, width=0.55, alpha=0.35, color=CATEGORY_COLORS[category], label="TestQty", zorder=1)
+    ax_qty.set_ylabel("TestQty")
+    ax_qty.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _p: f"{int(v):,}"))
+
+    ax_pct = ax_qty.twinx()
+    for i, bin_name in enumerate(top_bins):
+        color = BIN_LINE_COLORS[i % len(BIN_LINE_COLORS)]
+        props = bin_props[bin_name]
+        ax_pct.plot(
+            x,
+            props,
+            marker="o",
+            markersize=4,
+            label=bin_name,
+            color=color,
+            linewidth=1.8,
+            zorder=3,
+        )
+        for xi, y in zip(x, props):
+            if y is not None:
+                ax_pct.annotate(
+                    f"{y * 100:.1f}%",
+                    (xi, y),
+                    textcoords="offset points",
+                    xytext=(0, 8 + i * 2),
+                    ha="center",
+                    fontsize=6,
+                    color=color,
+                )
+
+    ax_pct.set_ylabel("Fail Bin 占比")
+    ax_pct.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
+    procs = sort_processes([p for p, c in process_category.items() if c == category])
+    ax_qty.set_xticks(x)
+    ax_qty.set_xticklabels(months, rotation=45, ha="right")
+    ax_qty.set_xlabel("YearMonth")
+    ax_qty.set_title(f"{category} TestQty 及 Top{len(top_bins)} Fail Bin 占比")
+    _merge_legends(ax_pct, ax_qty, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=7)
+    ax_qty.grid(True, alpha=0.3, zorder=0)
+    ax_pct.margins(y=0.15)
+    fig.subplots_adjust(right=0.72)
+    fig.tight_layout(rect=[0, 0, 0.72, 1])
 
 
 def build_monthly_summary(merged: pd.DataFrame) -> pd.DataFrame:
@@ -252,8 +404,13 @@ class YieldAnalyzerApp(tk.Tk):
         self.process_vars: dict[str, tk.StringVar] = {}
         self.merged_df: pd.DataFrame | None = None
         self.monthly_df: pd.DataFrame | None = None
+        self.bin_df: pd.DataFrame | None = None
+        self.file_format: str = "yield"
+        self.process_category: dict[str, str] = {}
         self.config = load_config()
         self._loading = False
+        self.chart_canvases: dict[str, FigureCanvasTkAgg] = {}
+        self.chart_figs: dict[str, Figure] = {}
 
         self._build_ui()
         self._restore_last_session()
@@ -289,22 +446,39 @@ class YieldAnalyzerApp(tk.Tk):
         ttk.Button(btn_frame, text="生成并导出", command=self._generate).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_frame, text="刷新图表", command=self._refresh_chart).pack(side=tk.LEFT)
 
-        chart_frame = ttk.LabelFrame(main, text="月度良率可视化", padding=4)
+        chart_frame = ttk.LabelFrame(main, text="数据可视化", padding=4)
         chart_frame.pack(fill=tk.BOTH, expand=True)
 
         self.notebook = ttk.Notebook(chart_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
-
-        self.fig_all = Figure(figsize=(10, 4), dpi=100)
-        self.canvas_all = FigureCanvasTkAgg(self.fig_all, master=self.notebook)
-        self.notebook.add(self.canvas_all.get_tk_widget(), text="全部工序")
-
-        self.fig_cat = Figure(figsize=(10, 4), dpi=100)
-        self.canvas_cat = FigureCanvasTkAgg(self.fig_cat, master=self.notebook)
-        self.notebook.add(self.canvas_cat.get_tk_widget(), text="温度分类")
+        self._setup_yield_tabs()
 
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(main, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(fill=tk.X, pady=(4, 0))
+
+    def _clear_chart_tabs(self):
+        for tab_id in self.notebook.tabs():
+            self.notebook.forget(tab_id)
+        self.chart_canvases.clear()
+        self.chart_figs.clear()
+
+    def _setup_yield_tabs(self):
+        self._clear_chart_tabs()
+        for key, title in (("all", "全部工序"), ("cat", "温度分类")):
+            fig = Figure(figsize=(10, 4), dpi=100)
+            canvas = FigureCanvasTkAgg(fig, master=self.notebook)
+            self.notebook.add(canvas.get_tk_widget(), text=title)
+            self.chart_figs[key] = fig
+            self.chart_canvases[key] = canvas
+
+    def _setup_bin_tabs(self):
+        self._clear_chart_tabs()
+        for cat in TEMP_LABELS:
+            fig = Figure(figsize=(10, 4), dpi=100)
+            canvas = FigureCanvasTkAgg(fig, master=self.notebook)
+            self.notebook.add(canvas.get_tk_widget(), text=f"{cat} Bin")
+            self.chart_figs[cat] = fig
+            self.chart_canvases[cat] = canvas
 
     def _browse_input(self):
         path = filedialog.askopenfilename(
@@ -348,8 +522,14 @@ class YieldAnalyzerApp(tk.Tk):
             messagebox.showwarning("提示", "请先选择输入文件")
             return
         try:
-            df = read_yield_file(path)
-            self.processes = sort_processes(df["工序"].astype(str).unique().tolist())
+            fmt, df = read_excel_file(path)
+            self.file_format = fmt
+            if fmt == "yield":
+                self.processes = sort_processes(df["工序"].astype(str).unique().tolist())
+                self._setup_yield_tabs()
+            else:
+                self.processes = sort_processes(df["TEST_STATE"].astype(str).unique().tolist())
+                self._setup_bin_tabs()
         except Exception as e:
             messagebox.showerror("读取失败", str(e))
             return
@@ -393,7 +573,10 @@ class YieldAnalyzerApp(tk.Tk):
         )
 
         saved_hint = "（已恢复上次分类）" if saved else ""
-        self.status_var.set(f"已加载 {len(self.processes)} 个工序: {', '.join(self.processes)}{saved_hint}")
+        fmt_hint = "Bin格式" if self.file_format == "bin" else "Yield格式"
+        self.status_var.set(
+            f"[{fmt_hint}] 已加载 {len(self.processes)} 个工序: {', '.join(self.processes)}{saved_hint}"
+        )
 
     def _validate_categories(self) -> dict[str, str] | None:
         if not self.processes:
@@ -419,8 +602,19 @@ class YieldAnalyzerApp(tk.Tk):
             return
 
         save_categories_for_file(input_path, mapping, self.config)
+        self.process_category = mapping
 
         try:
+            if self.file_format == "bin":
+                _, df = read_excel_file(input_path)
+                self.bin_df = df
+                self.merged_df = None
+                self.monthly_df = None
+                self._refresh_chart()
+                self.status_var.set(f"Bin 分析完成（{len(df)} 行）")
+                messagebox.showinfo("完成", "Bin 格式图表已生成（Bin 格式暂不导出 Excel）")
+                return
+
             df = read_yield_file(input_path)
             merged = merge_by_process(df, mapping)
             monthly = build_monthly_summary(merged)
@@ -437,11 +631,22 @@ class YieldAnalyzerApp(tk.Tk):
             messagebox.showerror("处理失败", str(e))
 
     def _refresh_chart(self):
+        mapping = self._validate_categories()
+        if mapping is None:
+            return
+        self.process_category = mapping
+
+        if self.file_format == "bin":
+            if self.bin_df is None:
+                try:
+                    _, self.bin_df = read_excel_file(self.input_path.get().strip())
+                except Exception:
+                    return
+            self._draw_bin_charts()
+            return
+
         if self.merged_df is None or self.monthly_df is None:
             if self.input_path.get().strip() and self.process_vars:
-                mapping = self._validate_categories()
-                if mapping is None:
-                    return
                 try:
                     df = read_yield_file(self.input_path.get().strip())
                     self.merged_df = merge_by_process(df, mapping)
@@ -454,9 +659,19 @@ class YieldAnalyzerApp(tk.Tk):
         self._draw_process_chart()
         self._draw_category_chart()
 
+    def _draw_bin_charts(self):
+        for cat in TEMP_LABELS:
+            draw_bin_category_chart(
+                self.chart_figs[cat],
+                self.bin_df,
+                self.process_category,
+                cat,
+            )
+            self.chart_canvases[cat].draw()
+
     def _draw_process_chart(self):
-        self.fig_all.clear()
-        ax = self.fig_all.add_subplot(111)
+        self.chart_figs["all"].clear()
+        ax = self.chart_figs["all"].add_subplot(111)
         monthly = self.monthly_df
         merged = self.merged_df
         months, total_yields = get_monthly_total_yields(merged)
@@ -506,12 +721,12 @@ class YieldAnalyzerApp(tk.Tk):
         _merge_legends(ax, ax_bar, loc="upper right", fontsize=8, ncol=2)
         ax.grid(True, alpha=0.3, zorder=0)
         ax.margins(y=0.12)
-        self.fig_all.tight_layout()
-        self.canvas_all.draw()
+        self.chart_figs["all"].tight_layout()
+        self.chart_canvases["all"].draw()
 
     def _draw_category_chart(self):
-        self.fig_cat.clear()
-        ax = self.fig_cat.add_subplot(111)
+        self.chart_figs["cat"].clear()
+        ax = self.chart_figs["cat"].add_subplot(111)
         merged = self.merged_df
         months, total_yields = get_monthly_total_yields(merged)
         x = list(range(len(months)))
@@ -598,9 +813,9 @@ class YieldAnalyzerApp(tk.Tk):
         _merge_legends(ax, ax_bar, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0, fontsize=8)
         ax.grid(True, alpha=0.3, zorder=0)
         ax.margins(y=0.12)
-        self.fig_cat.subplots_adjust(right=0.78)
-        self.fig_cat.tight_layout(rect=[0, 0, 0.78, 1])
-        self.canvas_cat.draw()
+        self.chart_figs["cat"].subplots_adjust(right=0.78)
+        self.chart_figs["cat"].tight_layout(rect=[0, 0, 0.78, 1])
+        self.chart_canvases["cat"].draw()
 
 
 def main():
