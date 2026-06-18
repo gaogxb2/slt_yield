@@ -20,6 +20,7 @@ plt.rcParams["axes.unicode_minus"] = False
 REQUIRED_COLUMNS = ["工序", "PassQty", "TestQty", "FailQty", "YearMonth"]
 BIN_REQUIRED_COLUMNS = ["TEST_STAGE", "BIN_NAME", "YEAR", "MONTH", "FAIL_QTY", "TEST_QTY"]
 PASS_BIN_NAMES = {"PASS", "Pass", "pass"}
+IGNORE_BIN_NAMES = {"ALL Vector"}
 TEMP_LABELS = ("常温", "低温", "高温")
 CATEGORY_COLORS = {"常温": "#4472C4", "低温": "#70AD47", "高温": "#ED7D31"}
 CONFIG_PATH = Path(__file__).parent / "process_categories.json"
@@ -130,11 +131,25 @@ def read_bin_file(filepath: str, raw: pd.DataFrame | None = None) -> pd.DataFram
     df["YEAR"] = df["YEAR"].astype(int)
     df["MONTH"] = df["MONTH"].astype(int)
     df["YearMonth"] = df["YEAR"].astype(str) + "-" + df["MONTH"].astype(str).str.zfill(2)
+    df = df[~df["BIN_NAME"].apply(is_ignored_bin)].copy()
     return df
+
+
+def is_ignored_bin(name: str) -> bool:
+    return name.strip() in IGNORE_BIN_NAMES
 
 
 def is_pass_bin(name: str) -> bool:
     return name.upper() == "PASS" or name in PASS_BIN_NAMES
+
+
+def _calc_category_month_test_qty(month_data: pd.DataFrame, procs: list[str]) -> int:
+    total = 0
+    for proc in procs:
+        proc_data = month_data[month_data["TEST_STAGE"] == proc]
+        if not proc_data.empty:
+            total += int(proc_data["TEST_QTY"].iloc[0])
+    return total
 
 
 def prepare_bin_category_chart(
@@ -147,15 +162,7 @@ def prepare_bin_category_chart(
         return [], [], [], {}
 
     months = sorted(sub["YearMonth"].unique())
-    test_qtys: list[int] = []
-    for ym in months:
-        month_data = sub[sub["YearMonth"] == ym]
-        qty = 0
-        for proc in procs:
-            proc_data = month_data[month_data["TEST_STAGE"] == proc]
-            if not proc_data.empty:
-                qty += int(proc_data["TEST_QTY"].iloc[0])
-        test_qtys.append(qty)
+    test_qtys = [_calc_category_month_test_qty(sub[sub["YearMonth"] == ym], procs) for ym in months]
 
     fail_data = sub[~sub["BIN_NAME"].apply(is_pass_bin)]
     top_bins = (
@@ -165,11 +172,7 @@ def prepare_bin_category_chart(
     bin_props: dict[str, list[float | None]] = {b: [] for b in top_bins}
     for ym in months:
         month_data = sub[sub["YearMonth"] == ym]
-        total_test = 0
-        for proc in procs:
-            proc_data = month_data[month_data["TEST_STAGE"] == proc]
-            if not proc_data.empty:
-                total_test += int(proc_data["TEST_QTY"].iloc[0])
+        total_test = _calc_category_month_test_qty(month_data, procs)
         for b in top_bins:
             if total_test == 0:
                 bin_props[b].append(None)
@@ -178,6 +181,93 @@ def prepare_bin_category_chart(
                 bin_props[b].append(fail / total_test)
 
     return months, test_qtys, top_bins, bin_props
+
+
+def build_bin_test_qty_summary(df: pd.DataFrame, process_category: dict[str, str]) -> pd.DataFrame:
+    rows = []
+    for cat in TEMP_LABELS:
+        months, test_qtys, _, _ = prepare_bin_category_chart(df, process_category, cat)
+        for ym, qty in zip(months, test_qtys):
+            rows.append({"YearMonth": ym, "温度类型": cat, "TestQty": qty})
+    if not rows:
+        return pd.DataFrame(columns=["YearMonth", "温度类型", "TestQty"])
+    cat_order = {cat: i for i, cat in enumerate(TEMP_LABELS)}
+    result = pd.DataFrame(rows)
+    result["_sort"] = result["温度类型"].map(cat_order)
+    return result.sort_values(["YearMonth", "_sort"]).drop(columns="_sort").reset_index(drop=True)
+
+
+def build_bin_prop_detail(df: pd.DataFrame, process_category: dict[str, str]) -> pd.DataFrame:
+    rows = []
+    for cat in TEMP_LABELS:
+        months, _, top_bins, bin_props = prepare_bin_category_chart(df, process_category, cat)
+        if not months:
+            continue
+        procs = sort_processes([p for p, c in process_category.items() if c == cat])
+        sub = df[df["TEST_STAGE"].isin(procs)]
+        for idx, ym in enumerate(months):
+            month_data = sub[sub["YearMonth"] == ym]
+            total_test = _calc_category_month_test_qty(month_data, procs)
+            for bin_name in top_bins:
+                prop = bin_props[bin_name][idx]
+                fail = int(month_data[month_data["BIN_NAME"] == bin_name]["FAIL_QTY"].sum())
+                rows.append(
+                    {
+                        "YearMonth": ym,
+                        "温度类型": cat,
+                        "BIN_NAME": bin_name,
+                        "FAIL_QTY": fail,
+                        "TEST_QTY": total_test,
+                        "占比": prop,
+                    }
+                )
+    if not rows:
+        return pd.DataFrame(columns=["YearMonth", "温度类型", "BIN_NAME", "FAIL_QTY", "TEST_QTY", "占比"])
+    cat_order = {cat: i for i, cat in enumerate(TEMP_LABELS)}
+    result = pd.DataFrame(rows)
+    result["_sort"] = result["温度类型"].map(cat_order)
+    return result.sort_values(["YearMonth", "_sort", "BIN_NAME"]).drop(columns="_sort").reset_index(drop=True)
+
+
+def build_bin_monthly_wide(df: pd.DataFrame, process_category: dict[str, str], category: str) -> pd.DataFrame:
+    months, test_qtys, top_bins, bin_props = prepare_bin_category_chart(df, process_category, category)
+    rows = []
+    for idx, ym in enumerate(months):
+        row: dict = {"YearMonth": ym, "TestQty": test_qtys[idx]}
+        for bin_name in top_bins:
+            row[bin_name] = bin_props[bin_name][idx]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _apply_excel_styles(writer, percent_headers: tuple[str, ...] = ("Yield", "总Yield", "占比")):
+    from openpyxl.styles import Font
+
+    bold = Font(bold=True)
+    for sheet_name in writer.sheets:
+        ws = writer.sheets[sheet_name]
+        for cell in ws[1]:
+            cell.font = bold
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                header = ws.cell(1, cell.column).value
+                if header and any(h in str(header) for h in percent_headers):
+                    cell.number_format = "0.00%"
+                elif header and any(h in str(header) for h in ("FDPPM", "FAIL_QTY", "TEST_QTY", "TestQty")):
+                    cell.number_format = "#,##0"
+
+
+def export_bin_excel(df: pd.DataFrame, process_category: dict[str, str], output_path: str):
+    test_qty = build_bin_test_qty_summary(df, process_category)
+    bin_detail = build_bin_prop_detail(df, process_category)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        test_qty.to_excel(writer, sheet_name="TestQty汇总", index=False)
+        bin_detail.to_excel(writer, sheet_name="Bin占比明细", index=False)
+        for cat in TEMP_LABELS:
+            build_bin_monthly_wide(df, process_category, cat).to_excel(
+                writer, sheet_name=f"{cat}月度Bin", index=False
+            )
+        _apply_excel_styles(writer)
 
 
 def merge_by_process(df: pd.DataFrame, process_category: dict[str, str]) -> pd.DataFrame:
@@ -374,21 +464,7 @@ def export_excel(
         monthly.to_excel(writer, sheet_name="月度良率", index=False)
         category.to_excel(writer, sheet_name="温度分类汇总", index=False)
         temp_qty.to_excel(writer, sheet_name="温度Qty合并", index=False)
-
-        from openpyxl.styles import Font
-
-        bold = Font(bold=True)
-        for sheet_name in writer.sheets:
-            ws = writer.sheets[sheet_name]
-            for cell in ws[1]:
-                cell.font = bold
-            for row in ws.iter_rows(min_row=2):
-                for cell in row:
-                    header = ws.cell(1, cell.column).value
-                    if header and ("Yield" in str(header) or header == "总Yield"):
-                        cell.number_format = "0.00%"
-                    elif header and "FDPPM" in str(header):
-                        cell.number_format = "#,##0"
+        _apply_excel_styles(writer)
 
 
 class YieldAnalyzerApp(tk.Tk):
@@ -610,9 +686,10 @@ class YieldAnalyzerApp(tk.Tk):
                 self.bin_df = df
                 self.merged_df = None
                 self.monthly_df = None
+                export_bin_excel(df, mapping, output_path)
                 self._refresh_chart()
-                self.status_var.set(f"Bin 分析完成（{len(df)} 行）")
-                messagebox.showinfo("完成", "Bin 格式图表已生成（Bin 格式暂不导出 Excel）")
+                self.status_var.set(f"已导出: {output_path}  ({len(df)} 行有效 Bin 数据)")
+                messagebox.showinfo("完成", f"Bin 分析 Excel 已导出至:\n{output_path}")
                 return
 
             df = read_yield_file(input_path)
